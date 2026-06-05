@@ -217,7 +217,7 @@
     const HIGHWAY_TYPES = [
       "motorway", "motorway_link", "trunk", "trunk_link",
       "primary", "primary_link", "secondary", "secondary_link",
-      "tertiary", "tertiary_link", "living_street", "residential", "service",
+      "tertiary", "tertiary_link", "living_street", "residential", "service", "unclassified",
     ];
 
     const HIGHWAY_STYLES = {
@@ -234,6 +234,7 @@
       living_street: { defaultLanes: 1, zorder: 11 },
       residential: { defaultLanes: 2, zorder: 12 },
       service: { defaultLanes: 1, zorder: 13 },
+      unclassified: { defaultLanes: 2, zorder: 14 },
     };
 
     const LANE_WIDTH = 3.0;
@@ -276,14 +277,24 @@
     const MAX_TREE_HEIGHT = 16;
     const Y_GREEN_PARK = 0.013;
     const Y_GREEN_ALLOTMENT = 0.015;
+    const Y_GREEN_SCRUB = 0.0145;
     const Y_GREEN_FOREST = 0.017;
     const FOREST_COLOR = 0x4a7a4c;
     const PARK_GREEN_COLOR = 0x5f9a55;
     const ALLOTMENT_COLOR = 0x6b9450;
+    const SCRUB_COLOR = 0x526952;
     const FOREST_TREE_DENSITY = 0.024;
+    const SCRUB_BUSH_DENSITY = 0.0168;
     const MIN_FOREST_AREA = 100;
+    const MIN_SCRUB_AREA = 80;
     const MAX_FOREST_TREES = 20000;
+    const MAX_SCRUB_BUSHES = 10000;
     const FOREST_TREE_GRID = 2.2;
+    const SCRUB_BUSH_GRID = 2.5;
+    const ROAD_TREE_CLEARANCE = 1.0;
+    const Y_BUSH = 0.02;
+    const MIN_BUSH_HEIGHT = 0.9;
+    const MAX_BUSH_HEIGHT = 2.4;
 
     const ROAD_LOD = {
       dividerHide: 720,
@@ -662,12 +673,12 @@
         `relation["building"](${south},${west},${north},${east});` +
         `node["natural"="tree"](${south},${west},${north},${east});` +
         `way["landuse"="residential"](${south},${west},${north},${east});` +
-        `way["landuse"~"^(forest|grass|meadow|recreation_ground|village_green|farmland|orchard|allotments|cemetery|greenfield|vineyard|flowerbed)$"](${south},${west},${north},${east});` +
+        `way["landuse"~"^(forest|grass|meadow|recreation_ground|village_green|farmland|orchard|allotments|cemetery|greenfield|vineyard|flowerbed|scrub)$"](${south},${west},${north},${east});` +
         `way["natural"~"^(wood|grassland|heath|scrub|wetland|fell)$"](${south},${west},${north},${east});` +
         `way["leisure"~"^(park|garden|nature_reserve|green|square|common|dog_park|golf_course|playground)$"](${south},${west},${north},${east});` +
         `way["place"="square"](${south},${west},${north},${east});` +
         `relation["landuse"="residential"](${south},${west},${north},${east});` +
-        `relation["landuse"~"^(forest|grass|meadow|recreation_ground|village_green|farmland|orchard|allotments|cemetery|greenfield|vineyard|flowerbed)$"](${south},${west},${north},${east});` +
+        `relation["landuse"~"^(forest|grass|meadow|recreation_ground|village_green|farmland|orchard|allotments|cemetery|greenfield|vineyard|flowerbed|scrub)$"](${south},${west},${north},${east});` +
         `relation["natural"~"^(wood|grassland|heath|scrub|wetland|fell)$"](${south},${west},${north},${east});` +
         `relation["leisure"~"^(park|garden|nature_reserve|green|square|common|dog_park|golf_course|playground)$"](${south},${west},${north},${east});` +
         `relation["place"="square"](${south},${west},${north},${east});` +
@@ -1254,6 +1265,29 @@
           };
         })
         .filter((road) => road.points.length >= 2);
+    }
+
+    function collectRoadClearanceSegments(elements, centerLat, centerLon) {
+      const segments = [];
+      for (const road of prepareRoadWays(elements, centerLat, centerLon)) {
+        const half = road.half + ROAD_TREE_CLEARANCE;
+        for (let i = 0; i < road.points.length - 1; i += 1) {
+          segments.push({
+            a: road.points[i],
+            b: road.points[i + 1],
+            half,
+          });
+        }
+      }
+      return segments;
+    }
+
+    function pointNearRoadClearance(x, z, roadSegments) {
+      for (const segment of roadSegments) {
+        const dist = distancePointToSegment(x, z, segment.a.x, segment.a.z, segment.b.x, segment.b.z);
+        if (dist < segment.half) return true;
+      }
+      return false;
     }
 
     function buildRoadNodeGraph(roads) {
@@ -1876,6 +1910,7 @@
       if (!tags) return null;
       if (tags.landuse === "forest" || tags.natural === "wood") return "forest";
       if (tags.landuse === "allotments") return "allotment";
+      if (tags.landuse === "scrub" || tags.natural === "scrub") return "scrub";
       if (tags.landuse === "cemetery" || tags.place === "square") return "park";
       const landuseGreen = [
         "grass", "meadow", "recreation_ground", "village_green",
@@ -1887,7 +1922,7 @@
         "common", "dog_park", "golf_course", "playground",
       ];
       if (leisureGreen.includes(tags.leisure)) return "park";
-      const naturalGreen = ["grassland", "heath", "scrub", "wetland", "fell"];
+      const naturalGreen = ["grassland", "heath", "wetland", "fell"];
       if (naturalGreen.includes(tags.natural)) return "park";
       return null;
     }
@@ -1895,6 +1930,7 @@
     const GREEN_LAYER_ORDER = [
       { kind: "park", renderOrder: 0.50 },
       { kind: "allotment", renderOrder: 0.52 },
+      { kind: "scrub", renderOrder: 0.53 },
       { kind: "forest", renderOrder: 0.54 },
     ];
 
@@ -1929,6 +1965,12 @@
     function* iterForests(elements) {
       for (const area of iterGreenAreas(elements)) {
         if (area.kind === "forest") yield area;
+      }
+    }
+
+    function* iterScrubs(elements) {
+      for (const area of iterGreenAreas(elements)) {
+        if (area.kind === "scrub") yield area;
       }
     }
 
@@ -2058,11 +2100,16 @@
       return `${Math.round(x / FOREST_TREE_GRID)}:${Math.round(z / FOREST_TREE_GRID)}`;
     }
 
+    function bushGridKey(x, z) {
+      return `b:${Math.round(x / SCRUB_BUSH_GRID)}:${Math.round(z / SCRUB_BUSH_GRID)}`;
+    }
+
     function addGreenAreaFloors(elements, centerLat, centerLon, materials, buildingFootprints = []) {
-      const buckets = { forest: [], park: [], allotment: [] };
+      const buckets = { forest: [], park: [], allotment: [], scrub: [] };
       const layerY = {
         park: Y_GREEN_PARK,
         allotment: Y_GREEN_ALLOTMENT,
+        scrub: Y_GREEN_SCRUB,
         forest: Y_GREEN_FOREST,
       };
 
@@ -2097,7 +2144,7 @@
       });
     }
 
-    function generateForestTrees(elements, centerLat, centerLon, occupied, buildingFootprints = []) {
+    function generateForestTrees(elements, centerLat, centerLon, occupied, buildingFootprints = [], roadClearanceSegments = []) {
       const conifers = [];
       const deciduous = [];
       const random = createSeededRandom(
@@ -2146,6 +2193,7 @@
           if (!pointInPolygon(x, z, ring)) continue;
           if (!isInsideSector(x, z)) continue;
           if (pointInsideAnyFootprint(x, z, buildingFootprints)) continue;
+          if (pointNearRoadClearance(x, z, roadClearanceSegments)) continue;
 
           const key = treeGridKey(x, z);
           if (occupied.has(key)) continue;
@@ -2197,7 +2245,7 @@
       return coniferHints.some((hint) => label.includes(hint));
     }
 
-    function collectTrees(elements, centerLat, centerLon, occupied, buildingFootprints = []) {
+    function collectTrees(elements, centerLat, centerLon, occupied, buildingFootprints = [], roadClearanceSegments = []) {
       const conifers = [];
       const deciduous = [];
       const seen = occupied || new Set();
@@ -2209,6 +2257,7 @@
         const { x, z } = latLonToXZ(element.lat, element.lon, centerLat, centerLon);
         if (!isInsideSector(x, z)) continue;
         if (pointInsideAnyFootprint(x, z, buildingFootprints)) continue;
+        if (pointNearRoadClearance(x, z, roadClearanceSegments)) continue;
 
         const key = treeGridKey(x, z);
         if (seen.has(key)) continue;
@@ -2220,6 +2269,110 @@
       }
 
       return { conifers, deciduous };
+    }
+
+    function generateScrubBushes(elements, centerLat, centerLon, occupied, buildingFootprints = [], roadClearanceSegments = []) {
+      const bushes = [];
+      const random = createSeededRandom(
+        Math.floor(centerLat * 100000) ^ Math.floor(centerLon * 100000) ^ 0x5a3b
+      );
+      let totalPlaced = 0;
+
+      for (const scrub of iterScrubs(elements)) {
+        if (totalPlaced >= MAX_SCRUB_BUSHES) break;
+
+        const ring = clipPolygonToSector(ringToXZ(scrub.geometry, centerLat, centerLon));
+        if (!ring || ring.length < 3) continue;
+
+        const area = Math.abs(polygonSignedArea(ring));
+        if (area < MIN_SCRUB_AREA) continue;
+
+        let targetCount = Math.floor(area * SCRUB_BUSH_DENSITY);
+        targetCount = Math.min(targetCount, MAX_SCRUB_BUSHES - totalPlaced);
+        if (targetCount <= 0) continue;
+
+        let minX = Infinity;
+        let maxX = -Infinity;
+        let minZ = Infinity;
+        let maxZ = -Infinity;
+        for (const point of ring) {
+          minX = Math.min(minX, point.x);
+          maxX = Math.max(maxX, point.x);
+          minZ = Math.min(minZ, point.z);
+          maxZ = Math.max(maxZ, point.z);
+        }
+        minX = Math.max(minX, -SECTOR_HALF);
+        maxX = Math.min(maxX, SECTOR_HALF);
+        minZ = Math.min(minZ, -SECTOR_HALF);
+        maxZ = Math.min(maxZ, SECTOR_HALF);
+        if (maxX <= minX || maxZ <= minZ) continue;
+
+        let placed = 0;
+        let attempts = 0;
+        const maxAttempts = targetCount * 20;
+
+        while (placed < targetCount && attempts < maxAttempts) {
+          attempts += 1;
+          const x = minX + random() * (maxX - minX);
+          const z = minZ + random() * (maxZ - minZ);
+          if (!pointInPolygon(x, z, ring)) continue;
+          if (!isInsideSector(x, z)) continue;
+          if (pointInsideAnyFootprint(x, z, buildingFootprints)) continue;
+          if (pointNearRoadClearance(x, z, roadClearanceSegments)) continue;
+
+          const key = bushGridKey(x, z);
+          if (occupied.has(key)) continue;
+          occupied.add(key);
+
+          bushes.push({
+            x,
+            z,
+            height: MIN_BUSH_HEIGHT + random() * (MAX_BUSH_HEIGHT - MIN_BUSH_HEIGHT),
+            rotation: random() * Math.PI * 2,
+          });
+          placed += 1;
+          totalPlaced += 1;
+        }
+      }
+
+      return bushes;
+    }
+
+    function buildBushInstances(bushes, bushMaterial) {
+      if (bushes.length === 0) return;
+
+      const blobGeometry = new THREE.SphereGeometry(1, 8, 6);
+      const lowerMesh = new THREE.InstancedMesh(blobGeometry, bushMaterial, bushes.length);
+      const upperMesh = new THREE.InstancedMesh(blobGeometry, bushMaterial, bushes.length);
+      lowerMesh.frustumCulled = false;
+      upperMesh.frustumCulled = false;
+
+      for (let i = 0; i < bushes.length; i += 1) {
+        const bush = bushes[i];
+        const height = bush.height;
+        const baseRadius = height * 0.42;
+
+        dummy.position.set(bush.x, Y_BUSH + height * 0.28, bush.z);
+        dummy.rotation.set(0, bush.rotation, 0);
+        dummy.scale.set(baseRadius * 1.12, height * 0.34, baseRadius * 0.95);
+        dummy.updateMatrix();
+        lowerMesh.setMatrixAt(i, dummy.matrix);
+
+        dummy.position.set(bush.x, Y_BUSH + height * 0.62, bush.z);
+        dummy.rotation.set(0, bush.rotation, 0);
+        dummy.scale.set(baseRadius * 0.82, height * 0.36, baseRadius * 0.78);
+        dummy.updateMatrix();
+        upperMesh.setMatrixAt(i, dummy.matrix);
+      }
+
+      dummy.scale.set(1, 1, 1);
+      dummy.rotation.set(0, 0, 0);
+      lowerMesh.instanceMatrix.needsUpdate = true;
+      upperMesh.instanceMatrix.needsUpdate = true;
+      lowerMesh.renderOrder = 6.5;
+      upperMesh.renderOrder = 6.6;
+      worldGroup.add(lowerMesh);
+      worldGroup.add(upperMesh);
     }
 
     function buildTreeInstances(trees, trunkGeometry, crownGeometry, trunkMaterial, crownMaterial, crownIsSphere) {
@@ -2265,10 +2418,34 @@
       worldGroup.add(crownMesh);
     }
 
-    function addTrees(elements, centerLat, centerLon, trunkMaterial, coniferCrownMaterial, deciduousCrownMaterial, buildingFootprints = []) {
+    function addTrees(
+      elements,
+      centerLat,
+      centerLon,
+      trunkMaterial,
+      coniferCrownMaterial,
+      deciduousCrownMaterial,
+      buildingFootprints = [],
+      roadClearanceSegments = [],
+      bushMaterial = null
+    ) {
       const occupied = new Set();
-      const forestTrees = generateForestTrees(elements, centerLat, centerLon, occupied, buildingFootprints);
-      const osmTrees = collectTrees(elements, centerLat, centerLon, occupied, buildingFootprints);
+      const forestTrees = generateForestTrees(
+        elements,
+        centerLat,
+        centerLon,
+        occupied,
+        buildingFootprints,
+        roadClearanceSegments
+      );
+      const osmTrees = collectTrees(
+        elements,
+        centerLat,
+        centerLon,
+        occupied,
+        buildingFootprints,
+        roadClearanceSegments
+      );
       const conifers = forestTrees.conifers.concat(osmTrees.conifers);
       const deciduous = forestTrees.deciduous.concat(osmTrees.deciduous);
 
@@ -2278,6 +2455,19 @@
 
       buildTreeInstances(conifers, trunkGeometry, sphereCrownGeometry, trunkMaterial, coniferCrownMaterial, true);
       buildTreeInstances(deciduous, trunkGeometry, coneCrownGeometry, trunkMaterial, deciduousCrownMaterial, false);
+
+      if (bushMaterial) {
+        const bushOccupied = new Set();
+        const bushes = generateScrubBushes(
+          elements,
+          centerLat,
+          centerLon,
+          bushOccupied,
+          buildingFootprints,
+          roadClearanceSegments
+        );
+        buildBushInstances(bushes, bushMaterial);
+      }
     }
 
     function addGroundPlane(groundMaterial) {
@@ -2425,6 +2615,15 @@
             polygonOffsetFactor: 3,
             polygonOffsetUnits: 3,
           }),
+          scrub: new THREE.MeshBasicMaterial({
+            color: SCRUB_COLOR,
+            side: THREE.DoubleSide,
+            depthWrite: true,
+            depthTest: true,
+            polygonOffset: true,
+            polygonOffsetFactor: 3,
+            polygonOffsetUnits: 3,
+          }),
         };
         addGreenAreaFloors(data.elements || [], lat, lon, greenMaterials, buildingFootprints);
 
@@ -2486,9 +2685,11 @@
         });
         addFootways(data.elements || [], lat, lon, footwayMaterial);
 
+        const roadClearanceSegments = collectRoadClearanceSegments(data.elements || [], lat, lon);
         const treeTrunkMaterial = new THREE.MeshBasicMaterial({ color: 0x5a3d28 });
         const coniferCrownMaterial = new THREE.MeshBasicMaterial({ color: 0x1a4228 });
         const deciduousCrownMaterial = new THREE.MeshBasicMaterial({ color: 0x245032 });
+        const bushMaterial = new THREE.MeshBasicMaterial({ color: 0x3d5c3a });
         addTrees(
           data.elements || [],
           lat,
@@ -2496,7 +2697,9 @@
           treeTrunkMaterial,
           coniferCrownMaterial,
           deciduousCrownMaterial,
-          buildingFootprints
+          buildingFootprints,
+          roadClearanceSegments,
+          bushMaterial
         );
 
         setFixedCamera();
