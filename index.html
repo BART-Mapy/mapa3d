@@ -177,7 +177,8 @@
     {
       "imports": {
         "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+        "polygon-clipping": "https://esm.sh/polygon-clipping@0.15.7"
       }
     }
   </script>
@@ -186,6 +187,7 @@
     import * as THREE from "three";
     import { MapControls } from "three/addons/controls/MapControls.js";
     import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
+    import polygonClipping from "polygon-clipping";
 
     const START_LAT = 52.285;
     const START_LON = 20.950;
@@ -193,6 +195,9 @@
     const SECTOR_SIZE = SECTOR_HALF * 2;
     const METERS_PER_DEG_LAT = 111320;
     const FLOOR_HEIGHT = 4;
+    const DEFAULT_BUILDING_LEVELS = 1;
+    const MAX_BUILDING_LEVELS = 70;
+    const MAX_BUILDING_HEIGHT = 280;
     const WINDOW_WIDTH = 1.3;
     const WINDOW_HEIGHT = 1.9;
     const WINDOW_SPACING = 2.6;
@@ -248,6 +253,13 @@
     const FLARE_ANGLE_DEG = 45;
     const MAX_LANE_CHANGE_LENGTH = 2.0;
     const BRIDGE_HEIGHT = 4;
+    const TUNNEL_DEPTH = 3;
+    const TUNNEL_ENTRANCE_RAMP = 5;
+    const TUNNEL_WALL_COLOR = 0x909090;
+    const TUNNEL_PORTAL_EDGE_COLOR = 0x525250;
+    const TUNNEL_PORTAL_LENGTH = 16;
+    const TUNNEL_PORTAL_HEIGHT = 3.5;
+    const TUNNEL_PORTAL_ROAD_OFFSET = 10;
     const BRIDGE_RAMP_SHORT = 15;
     const BRIDGE_RAMP_LONG = 30;
     const BRIDGE_LENGTH_THRESHOLD = 200;
@@ -282,7 +294,7 @@
     const FOREST_COLOR = 0x4a7a4c;
     const PARK_GREEN_COLOR = 0x5f9a55;
     const ALLOTMENT_COLOR = 0x6b9450;
-    const SCRUB_COLOR = 0x526952;
+    const SCRUB_COLOR = 0xc8d7ab;
     const FOREST_TREE_DENSITY = 0.024;
     const SCRUB_BUSH_DENSITY = 0.0168;
     const MIN_FOREST_AREA = 100;
@@ -631,13 +643,44 @@
       return clipPolylineToBounds(points, SECTOR_HALF);
     }
 
+    function reverseRingCopy(points) {
+      return points.slice().reverse();
+    }
+
+    function ringToShapePoints2D(points) {
+      return points.map((point) => new THREE.Vector2(point.x, -point.z));
+    }
+
     function buildShapeFromXZ(points) {
+      const shapePoints = ringToShapePoints2D(points);
+      const ring = THREE.ShapeUtils.isClockWise(shapePoints) ? points : reverseRingCopy(points);
       const shape = new THREE.Shape();
-      points.forEach((point, index) => {
+      ring.forEach((point, index) => {
         if (index === 0) shape.moveTo(point.x, -point.z);
         else shape.lineTo(point.x, -point.z);
       });
       shape.closePath();
+      return shape;
+    }
+
+    function buildShapeWithHoles(outerRing, holeRings) {
+      const outerShapePoints = ringToShapePoints2D(outerRing);
+      const outerClockwise = THREE.ShapeUtils.isClockWise(outerShapePoints);
+      const outer = outerClockwise ? outerRing : reverseRingCopy(outerRing);
+      const shape = buildShapeFromXZ(outer);
+
+      for (const holeRing of holeRings) {
+        const holeShapePoints = ringToShapePoints2D(holeRing);
+        const holeClockwise = THREE.ShapeUtils.isClockWise(holeShapePoints);
+        const hole = holeClockwise === outerClockwise ? reverseRingCopy(holeRing) : holeRing;
+        const holePath = new THREE.Path();
+        hole.forEach((point, index) => {
+          if (index === 0) holePath.moveTo(point.x, -point.z);
+          else holePath.lineTo(point.x, -point.z);
+        });
+        holePath.closePath();
+        shape.holes.push(holePath);
+      }
       return shape;
     }
 
@@ -667,7 +710,7 @@
         `[out:json];` +
         `(` +
         `way["highway"~"^(${types})$"](${south},${west},${north},${east});` +
-        `way["highway"="footway"](${south},${west},${north},${east});` +
+        `way["highway"~"^(footway|path)$"](${south},${west},${north},${east});` +
         `way["building"](${south},${west},${north},${east});` +
         `way["building:part"](${south},${west},${north},${east});` +
         `relation["building"](${south},${west},${north},${east});` +
@@ -789,6 +832,22 @@
       return value !== "no" && value !== "false";
     }
 
+    function isTunnelRoad(tags) {
+      if (tags?.tunnel) {
+        const value = String(tags.tunnel).toLowerCase();
+        if (value !== "no" && value !== "false") return true;
+      }
+      if (String(tags?.location || "").toLowerCase() === "underground") return true;
+      const layer = parseInt(String(tags?.layer ?? ""), 10);
+      if (!Number.isNaN(layer) && layer < 0) return true;
+      return false;
+    }
+
+    function isPedestrianHighway(tags) {
+      const highway = tags?.highway;
+      return highway === "footway" || highway === "path";
+    }
+
     function smoothstep01(t) {
       const x = THREE.MathUtils.clamp(t, 0, 1);
       return x * x * (3 - 2 * x);
@@ -831,6 +890,145 @@
       return { heights, cumDist, totalLength, rampLen };
     }
 
+    function computeTunnelVisualProfile(points, { rampStart = false, rampEnd = false }) {
+      const heights = new Float64Array(points.length);
+      const visible = new Uint8Array(points.length);
+      const cumDist = polylineCumulativeDistances(points);
+      const totalLength = cumDist[points.length - 1] || 0;
+      return {
+        heights,
+        visible,
+        cumDist,
+        totalLength,
+        rampLen: TUNNEL_ENTRANCE_RAMP,
+        portalStart: rampStart,
+        portalEnd: rampEnd,
+      };
+    }
+
+    function tunnelDirectionInto(road, endIndex) {
+      if (endIndex === 0) {
+        const a = road.points[0];
+        const b = road.points[1];
+        return { dx: b.x - a.x, dz: b.z - a.z };
+      }
+      const last = road.points.length - 1;
+      const a = road.points[last - 1];
+      const b = road.points[last];
+      return { dx: a.x - b.x, dz: a.z - b.z };
+    }
+
+    function collectTunnelPortals(roads, profiles, nodes) {
+      const portals = [];
+      const seen = new Set();
+
+      for (let roadIndex = 0; roadIndex < roads.length; roadIndex += 1) {
+        const road = roads[roadIndex];
+        if (!road.undergroundTunnel) continue;
+
+        for (const endIndex of [0, road.points.length - 1]) {
+          if (!roadEndpointNeedsTunnelPortal(roadIndex, endIndex, roads, nodes)) continue;
+
+          const point = road.points[endIndex];
+          const key = nodeKey(point.x, point.z);
+          if (seen.has(key)) continue;
+          seen.add(key);
+
+          const { dx, dz } = tunnelDirectionInto(road, endIndex);
+          const len = Math.hypot(dx, dz);
+          if (len < 0.05) continue;
+
+          const profile = profiles[roadIndex];
+          const offset = TUNNEL_PORTAL_ROAD_OFFSET;
+          const dirX = dx / len;
+          const dirZ = dz / len;
+          portals.push({
+            x: point.x - dirX * offset,
+            z: point.z - dirZ * offset,
+            dirX,
+            dirZ,
+            halfWidth: profile.pavement[endIndex] || road.half,
+          });
+        }
+      }
+
+      return portals;
+    }
+
+    function buildTunnelWedgeGeometry(portal) {
+      const halfW = portal.halfWidth;
+      const length = TUNNEL_PORTAL_LENGTH;
+      const height = TUNNEL_PORTAL_HEIGHT;
+
+      const positions = [
+        -halfW, 0, 0,
+        -halfW, height, 0,
+        -halfW, 0, length,
+        halfW, 0, 0,
+        halfW, height, 0,
+        halfW, 0, length,
+      ];
+      const indices = [
+        0, 2, 1,
+        3, 4, 5,
+        1, 2, 5, 1, 5, 4,
+      ];
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+      geometry.setIndex(indices);
+
+      const matrix = new THREE.Matrix4()
+        .makeRotationY(Math.atan2(portal.dirX, portal.dirZ))
+        .setPosition(portal.x, Y_GROUND, portal.z);
+      geometry.applyMatrix4(matrix);
+      geometry.computeVertexNormals();
+      return geometry;
+    }
+
+    function chainEndpointNeedsTunnelPortal(point, roads, componentIndices, nodes) {
+      const key = nodeKey(point.x, point.z);
+      for (const conn of nodes.get(key) || []) {
+        if (!componentIndices.includes(conn.roadIndex) && !roads[conn.roadIndex].undergroundTunnel) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    function roadEndpointNeedsTunnelPortal(roadIndex, endIndex, roads, nodes) {
+      const junction = roads[roadIndex].points[endIndex];
+      const key = nodeKey(junction.x, junction.z);
+      for (const conn of nodes.get(key) || []) {
+        if (conn.roadIndex === roadIndex) continue;
+        if (!roads[conn.roadIndex].undergroundTunnel) return true;
+      }
+      return false;
+    }
+
+    function mapChainTunnelProfileToRoad(road, chainPoints, chainProfile) {
+      const heights = new Float64Array(road.points.length);
+      const visible = new Uint8Array(road.points.length);
+      const { cumDist, heights: chainHeights, visible: chainVisible } = chainProfile;
+
+      for (let i = 0; i < road.points.length; i += 1) {
+        const distance = projectPointToChainDistance(road.points[i], chainPoints, cumDist);
+        heights[i] = bridgeHeightAtDistance(cumDist, chainHeights, distance);
+        let bestIndex = 0;
+        let bestError = Infinity;
+        for (let j = 0; j < cumDist.length; j += 1) {
+          const err = Math.abs(cumDist[j] - distance);
+          if (err < bestError) {
+            bestError = err;
+            bestIndex = j;
+          }
+        }
+        visible[i] = chainVisible[bestIndex];
+      }
+
+      return { heights, visible };
+    }
+
     function bridgeEndpointsMatch(roadA, endA, roadB, endB) {
       if (bridgeEndpointKey(roadA, endA) === bridgeEndpointKey(roadB, endB)) return true;
       const pa = roadA.points[endA];
@@ -869,36 +1067,36 @@
       return bestDistance;
     }
 
-    function chainEndpointNeedsGroundRamp(point, roads, componentIndices, nodes) {
+    function chainEndpointNeedsGroundRamp(point, roads, componentIndices, nodes, verticalKey) {
       const key = nodeKey(point.x, point.z);
       const connections = nodes.get(key) || [];
       for (const conn of connections) {
-        if (!componentIndices.includes(conn.roadIndex) && !roads[conn.roadIndex].elevatedBridge) {
+        if (!componentIndices.includes(conn.roadIndex) && !roads[conn.roadIndex][verticalKey]) {
           return true;
         }
       }
-      if (pointOnSectorEdge(point.x, point.z)) return true;
-      let bridgeLinks = 0;
+      if (verticalKey !== "undergroundTunnel" && pointOnSectorEdge(point.x, point.z)) return true;
+      let verticalLinks = 0;
       for (const conn of connections) {
-        if (componentIndices.includes(conn.roadIndex)) bridgeLinks += 1;
+        if (componentIndices.includes(conn.roadIndex)) verticalLinks += 1;
       }
-      return bridgeLinks <= 1;
+      return verticalLinks <= 1;
     }
 
-    function endpointNeedsGroundRamp(roadIndex, endIndex, roads, nodes) {
+    function endpointNeedsGroundRamp(roadIndex, endIndex, roads, nodes, verticalKey = "elevatedBridge") {
       const road = roads[roadIndex];
       const junction = road.points[endIndex];
-      if (pointOnSectorEdge(junction.x, junction.z)) return true;
+      if (verticalKey !== "undergroundTunnel" && pointOnSectorEdge(junction.x, junction.z)) return true;
       const key = nodeKey(junction.x, junction.z);
       const connections = nodes.get(key) || [];
       for (const conn of connections) {
         if (conn.roadIndex === roadIndex) continue;
-        if (!roads[conn.roadIndex].elevatedBridge) return true;
+        if (!roads[conn.roadIndex][verticalKey]) return true;
       }
       return false;
     }
 
-    function applyEndpointRampFromEnd(road, heights, endIndex) {
+    function applyEndpointRampFromEnd(road, heights, endIndex, fullDepth) {
       const cumDist = polylineCumulativeDistances(road.points);
       const totalLength = cumDist[cumDist.length - 1] || 0;
       if (totalLength < 0.5) return;
@@ -911,7 +1109,7 @@
         for (let i = 0; i < road.points.length; i += 1) {
           const distFromStart = cumDist[i];
           if (distFromStart > rampLen) break;
-          const rampH = BRIDGE_HEIGHT * smoothstep01(distFromStart / rampLen);
+          const rampH = fullDepth * smoothstep01(distFromStart / rampLen);
           heights[i] = Math.min(heights[i], rampH);
         }
         return;
@@ -920,7 +1118,7 @@
       for (let i = road.points.length - 1; i >= 0; i -= 1) {
         const distFromEnd = totalLength - cumDist[i];
         if (distFromEnd > rampLen) break;
-        const rampH = BRIDGE_HEIGHT * smoothstep01(distFromEnd / rampLen);
+        const rampH = fullDepth * smoothstep01(distFromEnd / rampLen);
         heights[i] = Math.min(heights[i], rampH);
       }
     }
@@ -931,11 +1129,11 @@
         if (!road.elevatedBridge || !road.bridgeProfile) continue;
         const heights = road.bridgeProfile.heights;
         const last = road.points.length - 1;
-        if (endpointNeedsGroundRamp(roadIndex, 0, roads, nodes)) {
-          applyEndpointRampFromEnd(road, heights, 0);
+        if (endpointNeedsGroundRamp(roadIndex, 0, roads, nodes, "elevatedBridge")) {
+          applyEndpointRampFromEnd(road, heights, 0, BRIDGE_HEIGHT);
         }
-        if (endpointNeedsGroundRamp(roadIndex, last, roads, nodes)) {
-          applyEndpointRampFromEnd(road, heights, last);
+        if (endpointNeedsGroundRamp(roadIndex, last, roads, nodes, "elevatedBridge")) {
+          applyEndpointRampFromEnd(road, heights, last, BRIDGE_HEIGHT);
         }
       }
     }
@@ -1046,20 +1244,70 @@
       return false;
     }
 
-    function collectBridgeComponent(roads, startIdx, visited) {
+    function collectVerticalComponent(roads, startIdx, visited, verticalKey) {
       const component = [];
       const stack = [startIdx];
       while (stack.length > 0) {
         const idx = stack.pop();
-        if (visited.has(idx) || !roads[idx].elevatedBridge) continue;
+        if (visited.has(idx) || !roads[idx][verticalKey]) continue;
         visited.add(idx);
         component.push(idx);
         for (let j = 0; j < roads.length; j += 1) {
-          if (j === idx || visited.has(j) || !roads[j].elevatedBridge) continue;
+          if (j === idx || visited.has(j) || !roads[j][verticalKey]) continue;
           if (bridgeRoadsShareEndpoint(roads, idx, j)) stack.push(j);
         }
       }
       return component;
+    }
+
+    function collectBridgeComponent(roads, startIdx, visited) {
+      return collectVerticalComponent(roads, startIdx, visited, "elevatedBridge");
+    }
+
+    function mergeVerticalChains(roads, nodes, { verticalKey, profileKey, computeProfile }) {
+      const visited = new Set();
+      for (let i = 0; i < roads.length; i += 1) {
+        if (!roads[i][verticalKey] || visited.has(i)) continue;
+        const component = collectVerticalComponent(roads, i, visited, verticalKey);
+        const chainPoints = buildOrderedBridgeChain(roads, component);
+        const chainProfile = computeProfile(chainPoints, {
+          rampStart: chainEndpointNeedsGroundRamp(chainPoints[0], roads, component, nodes, verticalKey),
+          rampEnd: chainEndpointNeedsGroundRamp(
+            chainPoints[chainPoints.length - 1],
+            roads,
+            component,
+            nodes,
+            verticalKey
+          ),
+        });
+        for (const roadIdx of component) {
+          roads[roadIdx][profileKey] = {
+            heights: mapChainHeightsToRoad(roads[roadIdx], chainPoints, chainProfile),
+            cumDist: chainProfile.cumDist,
+            totalLength: chainProfile.totalLength,
+            rampLen: chainProfile.rampLen,
+          };
+        }
+      }
+
+      for (let i = 0; i < roads.length; i += 1) {
+        if (!roads[i][verticalKey] || roads[i][profileKey]) continue;
+        const profile = computeProfile(roads[i].points);
+        roads[i][profileKey] = {
+          heights: profile.heights,
+          cumDist: profile.cumDist,
+          totalLength: profile.totalLength,
+          rampLen: profile.rampLen,
+        };
+      }
+    }
+
+    function mergeBridgeChains(roads, nodes) {
+      mergeVerticalChains(roads, nodes, {
+        verticalKey: "elevatedBridge",
+        profileKey: "bridgeProfile",
+        computeProfile: computeBridgeElevationProfile,
+      });
     }
 
     function countBridgeNeighborsAtEndpoint(roads, indices, roadIdx, endIndex) {
@@ -1139,15 +1387,29 @@
       return heights;
     }
 
-    function mergeBridgeChains(roads, nodes) {
+    function resolveBridges(roads, nodes) {
+      resolveBridgeEligibility(roads);
+      mergeBridgeChains(roads, nodes);
+      applyBridgeEndpointRamps(roads, nodes);
+    }
+
+    function resolveTunnelEligibility(roads) {
+      for (let roadIndex = 0; roadIndex < roads.length; roadIndex += 1) {
+        const road = roads[roadIndex];
+        road.undergroundTunnel = road.isTunnel;
+        road.tunnelProfile = null;
+      }
+    }
+
+    function mergeTunnelChains(roads, nodes) {
       const visited = new Set();
       for (let i = 0; i < roads.length; i += 1) {
-        if (!roads[i].elevatedBridge || visited.has(i)) continue;
-        const component = collectBridgeComponent(roads, i, visited);
+        if (!roads[i].undergroundTunnel || visited.has(i)) continue;
+        const component = collectVerticalComponent(roads, i, visited, "undergroundTunnel");
         const chainPoints = buildOrderedBridgeChain(roads, component);
-        const chainProfile = computeBridgeElevationProfile(chainPoints, {
-          rampStart: chainEndpointNeedsGroundRamp(chainPoints[0], roads, component, nodes),
-          rampEnd: chainEndpointNeedsGroundRamp(
+        const chainProfile = computeTunnelVisualProfile(chainPoints, {
+          rampStart: chainEndpointNeedsTunnelPortal(chainPoints[0], roads, component, nodes),
+          rampEnd: chainEndpointNeedsTunnelPortal(
             chainPoints[chainPoints.length - 1],
             roads,
             component,
@@ -1155,8 +1417,9 @@
           ),
         });
         for (const roadIdx of component) {
-          roads[roadIdx].bridgeProfile = {
-            heights: mapChainHeightsToRoad(roads[roadIdx], chainPoints, chainProfile),
+          const mapped = mapChainTunnelProfileToRoad(roads[roadIdx], chainPoints, chainProfile);
+          roads[roadIdx].tunnelProfile = {
+            ...mapped,
             cumDist: chainProfile.cumDist,
             totalLength: chainProfile.totalLength,
             rampLen: chainProfile.rampLen,
@@ -1165,21 +1428,19 @@
       }
 
       for (let i = 0; i < roads.length; i += 1) {
-        if (!roads[i].elevatedBridge || roads[i].bridgeProfile) continue;
-        const profile = computeBridgeElevationProfile(roads[i].points);
-        roads[i].bridgeProfile = {
-          heights: profile.heights,
-          cumDist: profile.cumDist,
-          totalLength: profile.totalLength,
-          rampLen: profile.rampLen,
-        };
+        if (!roads[i].undergroundTunnel || roads[i].tunnelProfile) continue;
+        const last = roads[i].points.length - 1;
+        const profile = computeTunnelVisualProfile(roads[i].points, {
+          rampStart: roadEndpointNeedsTunnelPortal(i, 0, roads, nodes),
+          rampEnd: roadEndpointNeedsTunnelPortal(i, last, roads, nodes),
+        });
+        roads[i].tunnelProfile = profile;
       }
     }
 
-    function resolveBridges(roads, nodes) {
-      resolveBridgeEligibility(roads);
-      mergeBridgeChains(roads, nodes);
-      applyBridgeEndpointRamps(roads, nodes);
+    function resolveTunnels(roads, nodes) {
+      resolveTunnelEligibility(roads);
+      mergeTunnelChains(roads, nodes);
     }
 
     function addBridgePillars(roads, buildingFootprints, pillarMaterial) {
@@ -1254,14 +1515,21 @@
           const lanes = roadLanes(element.tags);
           const half = roadHalfWidth(lanes);
           const isBridge = isBridgeRoad(element.tags);
+          const isTunnel = !isBridge && isTunnelRoad(element.tags);
+          const style = highwayStyle(element.tags);
           return {
             element,
             points,
             lanes,
             half,
+            highway: element.tags?.highway || "",
+            zorder: style?.zorder ?? 99,
             isBridge,
+            isTunnel,
             elevatedBridge: false,
+            undergroundTunnel: false,
             bridgeProfile: null,
+            tunnelProfile: null,
           };
         })
         .filter((road) => road.points.length >= 2);
@@ -1358,7 +1626,7 @@
       });
     }
 
-    function buildRoadRibbonVariable(points, halfWidths, baseY, elevationProfile = null) {
+    function buildRoadRibbonWithMask(points, halfWidths, baseY, elevationProfile, visibleMask = null) {
       if (points.length < 2) return null;
 
       const { right, left } = roadEdgePoints(points, halfWidths);
@@ -1367,6 +1635,8 @@
       let vertexIndex = 0;
 
       for (let i = 0; i < points.length - 1; i += 1) {
+        if (visibleMask && (!visibleMask[i] || !visibleMask[i + 1])) continue;
+
         const p0 = points[i];
         const p1 = points[i + 1];
         const dx = p1.x - p0.x;
@@ -1411,19 +1681,125 @@
       return geometry;
     }
 
+    function buildRoadRibbonVariable(points, halfWidths, baseY, elevationProfile = null) {
+      return buildRoadRibbonWithMask(points, halfWidths, baseY, elevationProfile, null);
+    }
+
+    function pushQuadPositions(positions, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz) {
+      positions.push(ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz);
+    }
+
     function buildRoadRibbon(points, halfWidth, y) {
       const halfWidths = new Float64Array(points.length).fill(halfWidth);
       return buildRoadRibbonVariable(points, halfWidths, y);
     }
 
-    function buildingLevels(tags) {
-      for (const key of ["building:levels", "levels"]) {
-        const value = tags[key];
-        if (!value) continue;
-        const parsed = parseInt(String(value).split(";")[0], 10);
-        if (!Number.isNaN(parsed) && parsed > 0) return parsed;
+    function parseNumericMeters(tags, keys) {
+      for (const key of keys) {
+        const raw = tags?.[key];
+        if (raw === undefined || raw === "") continue;
+        const parsed = parseFloat(String(raw).replace(",", ".").replace(/\s*m$/i, "").trim());
+        if (!Number.isNaN(parsed)) return parsed;
       }
-      return 1;
+      return null;
+    }
+
+    function parseLevelValue(raw) {
+      if (raw === undefined || raw === "") return null;
+      const str = String(raw).trim();
+      if (str.includes("-")) {
+        const [lo, hi] = str.split("-", 2).map((part) => parseInt(part.trim(), 10));
+        if (!Number.isNaN(lo) && !Number.isNaN(hi) && hi >= lo) {
+          return { min: lo, max: hi, count: hi - lo + 1 };
+        }
+      }
+      const parsed = parseInt(str.split(";")[0].trim(), 10);
+      if (!Number.isNaN(parsed)) return { value: parsed };
+      return null;
+    }
+
+    function tagHasValue(tags, key) {
+      const raw = tags?.[key];
+      return raw !== undefined && raw !== "";
+    }
+
+    function buildingMinLevel(tags) {
+      const parsed = parseLevelValue(tags?.["building:min_level"] ?? tags?.min_level);
+      if (!parsed) return 0;
+      if (parsed.min !== undefined) return parsed.min;
+      return parsed.value ?? 0;
+    }
+
+    function buildingMaxLevel(tags) {
+      const parsed = parseLevelValue(tags?.["building:max_level"] ?? tags?.max_level);
+      if (!parsed) return null;
+      if (parsed.max !== undefined) return parsed.max;
+      return parsed.value ?? null;
+    }
+
+    function partBaseOffset(tags) {
+      return buildingMinLevel(tags) * FLOOR_HEIGHT;
+    }
+
+    function levelsFromTags(tags) {
+      for (const key of ["building:levels", "levels"]) {
+        const parsed = parseLevelValue(tags?.[key]);
+        if (!parsed) continue;
+        if (parsed.count !== undefined) return parsed.count;
+        if (parsed.value !== undefined && parsed.value > 0) return parsed.value;
+      }
+      return null;
+    }
+
+    function resolveTopLevel(tags) {
+      const maxLevel = buildingMaxLevel(tags);
+      if (maxLevel !== null) return Math.min(maxLevel, MAX_BUILDING_LEVELS);
+      const levels = levelsFromTags(tags);
+      if (levels !== null) return Math.min(levels, MAX_BUILDING_LEVELS);
+      return DEFAULT_BUILDING_LEVELS;
+    }
+
+    function clampBuildingHeight(height) {
+      return THREE.MathUtils.clamp(height, FLOOR_HEIGHT * 0.3, MAX_BUILDING_HEIGHT);
+    }
+
+    function hasFloorLevelTags(tags) {
+      if (levelsFromTags(tags) !== null) return true;
+      const maxLevel = buildingMaxLevel(tags);
+      const minLevel = buildingMinLevel(tags);
+      return maxLevel !== null && maxLevel >= minLevel;
+    }
+
+    function windowLevelsFromHeight(height) {
+      return Math.max(1, Math.round(height / FLOOR_HEIGHT));
+    }
+
+    /** Z-top i ekstruzja wyłącznie z kondygnacji (ignoruj height/min_height w metrach). */
+    function resolveLevelVertical(tags, baseLevelOffset = 0) {
+      const minLevel = buildingMinLevel(tags);
+      const topLevel = Math.max(resolveTopLevel(tags), minLevel + DEFAULT_BUILDING_LEVELS);
+      const baseOffset = (baseLevelOffset + minLevel) * FLOOR_HEIGHT;
+      const zTop = topLevel * FLOOR_HEIGHT;
+      const height = clampBuildingHeight(Math.max(FLOOR_HEIGHT * 0.25, zTop - baseOffset));
+      const windowLevels = minLevel > 0
+        ? Math.max(1, topLevel - minLevel)
+        : Math.max(1, topLevel);
+      return { baseOffset, height, windowLevels, startLevel: minLevel, topLevel };
+    }
+
+    function resolvePartVertical(tags) {
+      return resolveLevelVertical(tags, 0);
+    }
+
+    function resolveMainBuildingVertical(tags) {
+      return resolveLevelVertical(tags, 0);
+    }
+
+    function resolveBuildingVertical(tags, isPart, buildingTags = null) {
+      if (isPart) {
+        return resolvePartVertical(tags);
+      }
+      return resolveMainBuildingVertical(tags);
     }
 
     function closeRing(geometry) {
@@ -1463,9 +1839,14 @@
       return Boolean(tags.building);
     }
 
+    function partMemberTags(member, wayById) {
+      const wayTags = wayById.get(member.ref)?.tags || {};
+      const inlineTags = member.tags || {};
+      return { ...wayTags, ...inlineTags };
+    }
+
     function memberWayTags(member, wayById, relationTags) {
-      if (member.tags && Object.keys(member.tags).length > 0) return member.tags;
-      return wayById.get(member.ref)?.tags || relationTags || {};
+      return partMemberTags(member, wayById);
     }
 
     function isBuildingPartMember(member, wayById, relationTags) {
@@ -1473,6 +1854,15 @@
       if (isBuildingRoofTags(tags)) return false;
       if (member.role === "part") return true;
       return isBuildingPartTags(tags);
+    }
+
+    function relationHasBuildingParts(relation, wayById) {
+      for (const member of relation.members || []) {
+        if (member.type !== "way" || !member.geometry) continue;
+        if (member.role === "inner") continue;
+        if (isBuildingPartMember(member, wayById, relation.tags)) return true;
+      }
+      return false;
     }
 
     function* iterBuildings(elements) {
@@ -1489,7 +1879,9 @@
         const isPart = isBuildingPartTags(tags);
         yield {
           tags,
+          buildingTags: null,
           geometry: ring,
+          innerRings: [],
           fillSolid: false,
           isPart,
         };
@@ -1498,7 +1890,13 @@
       for (const element of elements) {
         if (element.type !== "relation" || !element.tags?.building) continue;
         if (isBuildingRoofTags(element.tags)) continue;
-        const hasInnerCourtyard = (element.members || []).some((member) => member.role === "inner");
+        const hasParts = relationHasBuildingParts(element, wayById);
+        const innerRings = [];
+        for (const member of element.members || []) {
+          if (member.type !== "way" || member.role !== "inner" || !member.geometry) continue;
+          const innerRing = closeRing(member.geometry);
+          if (innerRing) innerRings.push(innerRing);
+        }
         for (const member of element.members || []) {
           if (member.type !== "way" || !member.geometry) continue;
           if (member.role === "inner") continue;
@@ -1509,14 +1907,38 @@
           if (!ring || drawn.has(member.ref)) continue;
           drawn.add(member.ref);
           const isPart = isBuildingPartMember(member, wayById, element.tags);
+          const partTags = partMemberTags(member, wayById);
           yield {
-            tags: isPart ? memberTags : element.tags,
+            tags: isPart ? partTags : element.tags,
+            buildingTags: isPart ? element.tags : null,
             geometry: ring,
-            fillSolid: hasInnerCourtyard && !isPart,
+            innerRings: !isPart ? innerRings : [],
+            fillSolid: false,
             isPart,
           };
         }
       }
+    }
+
+    function clipInnerRings(innerRings, centerLat, centerLon, outerRing) {
+      const clipped = [];
+      for (const innerRing of innerRings) {
+        const ringXZ = ringToXZ(innerRing, centerLat, centerLon);
+        if (!ringIntersectsSector(ringXZ)) continue;
+        const innerClipped = clipPolygonToGround(ringXZ);
+        if (!innerClipped || innerClipped.length < 3) continue;
+        if (!polygonsOverlap(outerRing, innerClipped)) continue;
+        clipped.push(innerClipped);
+      }
+      return clipped;
+    }
+
+    function buildBuildingShape(clippedOuter, clippedInners, fillSolid) {
+      if (clippedInners.length > 0) {
+        return buildShapeWithHoles(clippedOuter, clippedInners);
+      }
+      const footprint = resolveBuildingFootprint(clippedOuter, fillSolid);
+      return buildShapeFromXZ(footprint);
     }
 
     function clipBuildingFootprint(element, centerLat, centerLon) {
@@ -1524,6 +1946,7 @@
       if (!ringIntersectsSector(ringXZ)) return null;
       const clipped = clipPolygonToGround(ringXZ);
       if (!clipped || clipped.length < 3) return null;
+      if ((element.innerRings || []).length > 0) return clipped;
       return resolveBuildingFootprint(clipped, element.fillSolid);
     }
 
@@ -1656,12 +2079,12 @@
       return { nx: -dz / len, nz: dx / len };
     }
 
-    function collectWindowSlotsFromXZ(points, levels) {
+    function collectWindowSlotsFromXZ(points, windowLevels, baseY = Y_BUILDING) {
       if (points.length < 3) return;
       const ccw = polygonSignedArea(points) > 0;
 
-      for (let floor = 0; floor < levels; floor += 1) {
-        const y = floor * FLOOR_HEIGHT + FLOOR_HEIGHT * 0.5;
+      for (let floor = 0; floor < windowLevels; floor += 1) {
+        const y = baseY + floor * FLOOR_HEIGHT + FLOOR_HEIGHT * 0.5;
         for (let i = 0; i < points.length; i += 1) {
           const p0 = points[i];
           const p1 = points[(i + 1) % points.length];
@@ -1685,9 +2108,243 @@
       }
     }
 
-    function collectWindowSlots(ring, levels, centerLat, centerLon) {
+    function collectWindowSlots(ring, windowLevels, centerLat, centerLon, baseY = Y_BUILDING) {
       const points = ring.slice(0, -1).map((p) => latLonToXZ(p.lat, p.lon, centerLat, centerLon));
-      collectWindowSlotsFromXZ(points, levels);
+      collectWindowSlotsFromXZ(points, windowLevels, baseY);
+    }
+
+    function ringCentroid(ring) {
+      const limit = ring.length > 1
+        && Math.abs(ring[0].x - ring[ring.length - 1].x) < 1e-6
+        && Math.abs(ring[0].z - ring[ring.length - 1].z) < 1e-6
+        ? ring.length - 1
+        : ring.length;
+      if (limit === 0) return { x: 0, z: 0 };
+      let x = 0;
+      let z = 0;
+      for (let i = 0; i < limit; i += 1) {
+        x += ring[i].x;
+        z += ring[i].z;
+      }
+      return { x: x / limit, z: z / limit };
+    }
+
+    function partCoverageRatio(clippedRing, partFootprints) {
+      const overlapping = partHolesForBuilding(clippedRing, partFootprints);
+      if (!overlapping.length) return 0;
+      const original = Math.abs(polygonSignedArea(clippedRing));
+      if (original < 1) return 0;
+      const remaining = subtractFootprintPieces(clippedRing, overlapping);
+      let remainArea = 0;
+      for (const piece of remaining) remainArea += Math.abs(polygonSignedArea(piece.outer));
+      return 1 - remainArea / original;
+    }
+
+    function isInsidePartFootprint(clippedRing, partFootprints) {
+      return partFootprints.some((part) => clippedRing.every((point) => pointInPolygon(point.x, point.z, part)));
+    }
+
+    function mainBuildingLevelCount(tags) {
+      return resolveLevelVertical(tags).windowLevels;
+    }
+
+    function maxOverlappingPartLevelCount(clippedRing, buildings, centerLat, centerLon) {
+      let maxLevels = 0;
+      for (const building of buildings) {
+        if (!building.isPart) continue;
+        const partRing = clipBuildingRing(building, centerLat, centerLon);
+        if (!partRing || !polygonsOverlap(clippedRing, partRing)) continue;
+        const { windowLevels } = resolvePartVertical(building.tags || {});
+        maxLevels = Math.max(maxLevels, windowLevels);
+      }
+      return maxLevels;
+    }
+
+    function isNestedBuildingFootprint(innerGeometry, outerGeometry) {
+      if (innerGeometry === outerGeometry) return false;
+      const outerArea = Math.abs(polygonSignedArea(outerGeometry));
+      const innerArea = Math.abs(polygonSignedArea(innerGeometry));
+      if (outerArea < 1 || innerArea < 1) return false;
+      if (innerArea >= outerArea * 0.995) return false;
+      if (!polygonsOverlap(outerGeometry, innerGeometry)) return false;
+      const centroid = ringCentroid(innerGeometry);
+      return pointInPolygon(centroid.x, centroid.z, outerGeometry);
+    }
+
+    function nestedOutlineFootprints(outline, outlines) {
+      const footprints = [];
+      for (const other of outlines) {
+        if (other === outline) continue;
+        if (isNestedBuildingFootprint(other.geometry, outline.geometry)) {
+          footprints.push(other.geometry);
+        }
+      }
+      return footprints;
+    }
+
+    function shouldSkipRedundantMainBuilding(clippedRing, partFootprints, buildings, tags, centerLat, centerLon) {
+      if (!partFootprints.length) return false;
+
+      for (const building of buildings) {
+        if (!building.isPart) continue;
+        const partRing = clipBuildingRing(building, centerLat, centerLon);
+        if (!partRing || !polygonsOverlap(clippedRing, partRing)) continue;
+        const { baseOffset } = resolvePartVertical(building.tags || {});
+        if (baseOffset > 0) return false;
+      }
+
+      if (isInsidePartFootprint(clippedRing, partFootprints)) return true;
+
+      const mainLevels = mainBuildingLevelCount(tags);
+      const maxPartLevels = maxOverlappingPartLevelCount(clippedRing, buildings, centerLat, centerLon);
+      if (maxPartLevels > 0 && mainLevels > maxPartLevels * 2) return true;
+
+      const buildingArea = Math.abs(polygonSignedArea(clippedRing));
+      const centroid = ringCentroid(clippedRing);
+
+      for (const part of partFootprints) {
+        if (!polygonsOverlap(clippedRing, part)) continue;
+        const partArea = Math.abs(polygonSignedArea(part));
+        const coverage = partCoverageRatio(clippedRing, [part]);
+        if (buildingArea <= partArea * 1.08 && coverage >= 0.55) return true;
+        if (pointInPolygon(centroid.x, centroid.z, part) && coverage >= 0.65) return true;
+      }
+
+      return partCoverageRatio(clippedRing, partFootprints) >= 0.92;
+    }
+
+    function hasAssignedHeight(tags) {
+      return hasFloorLevelTags(tags);
+    }
+
+    function resolvePartVolumeTags(partTags) {
+      return partTags || {};
+    }
+
+    function buildBuildingFeatures(elements, centerLat, centerLon) {
+      const allBuildings = [...iterBuildings(elements)];
+      const outlines = [];
+      const parts = [];
+
+      for (const building of allBuildings) {
+        const clipped = clipBuildingRing(building, centerLat, centerLon);
+        if (!clipped || clipped.length < 3) continue;
+        const feature = {
+          geometry: clipped,
+          innerRings: building.innerRings || [],
+          tags: building.tags || {},
+          fillSolid: building.fillSolid,
+        };
+        if (building.isPart) parts.push(feature);
+        else outlines.push(feature);
+      }
+
+      return { outlines, parts, allBuildings };
+    }
+
+    function spatialJoinBuildingVolumes(elements, centerLat, centerLon) {
+      const { outlines, parts, allBuildings } = buildBuildingFeatures(elements, centerLat, centerLon);
+      const partFootprints = parts.map((part) => part.geometry);
+      const volumes = [];
+
+      for (const part of parts) {
+        const tags = resolvePartVolumeTags(part.tags);
+        const vertical = resolvePartVertical(tags);
+        volumes.push({
+          footprintPieces: [{ outer: part.geometry, holes: [] }],
+          roofRing: part.geometry,
+          roofHoles: [],
+          tags,
+          isPart: true,
+          fillSolid: false,
+        });
+        if (vertical.baseOffset > 0.05) {
+          volumes.push({
+            footprintPieces: [{ outer: part.geometry, holes: [] }],
+            roofRing: part.geometry,
+            roofHoles: [],
+            tags,
+            isPart: true,
+            fillSolid: false,
+            verticalOverride: {
+              baseOffset: 0,
+              height: vertical.baseOffset,
+              windowLevels: windowLevelsFromHeight(vertical.baseOffset),
+            },
+          });
+        }
+      }
+
+      for (const outline of outlines) {
+        const courtyardHoles = clipInnerRings(
+          outline.innerRings,
+          centerLat,
+          centerLon,
+          outline.geometry
+        );
+        const overlappingParts = parts.filter((part) => polygonsOverlap(outline.geometry, part.geometry));
+        const partHoles = overlappingParts.map((part) => part.geometry);
+        const nestedHoles = nestedOutlineFootprints(outline, outlines);
+        const footprintPieces = resolveFootprintPieces(
+          outline.geometry,
+          courtyardHoles,
+          [...partHoles, ...nestedHoles],
+          false
+        );
+
+        let remainArea = 0;
+        for (const piece of footprintPieces) {
+          remainArea += Math.abs(polygonSignedArea(piece.outer));
+        }
+
+        const skipMain = shouldSkipRedundantMainBuilding(
+          outline.geometry,
+          partFootprints,
+          allBuildings,
+          outline.tags,
+          centerLat,
+          centerLon
+        );
+
+        if (skipMain) continue;
+        if (remainArea < 1) continue;
+
+        for (const piece of footprintPieces) {
+          if (Math.abs(polygonSignedArea(piece.outer)) < 1) continue;
+          volumes.push({
+            footprintPieces: [piece],
+            roofRing: piece.outer,
+            roofHoles: piece.holes || [],
+            tags: outline.tags,
+            isPart: false,
+            fillSolid: outline.fillSolid,
+          });
+        }
+      }
+
+      return volumes;
+    }
+
+    function clipBuildingRing(building, centerLat, centerLon) {
+      const ringXZ = ringToXZ(building.geometry, centerLat, centerLon);
+      if (!ringIntersectsSector(ringXZ)) return null;
+      return clipPolygonToGround(ringXZ);
+    }
+
+    function resolveFootprintPieces(clippedRing, courtyardHoles, partHoles, isPart) {
+      if (isPart || partHoles.length === 0) {
+        return [{ outer: clippedRing, holes: courtyardHoles }];
+      }
+
+      const pieces = subtractFootprintPieces(clippedRing, partHoles);
+      if (pieces.length === 0) {
+        return [{ outer: clippedRing, holes: courtyardHoles }];
+      }
+
+      return pieces.map((piece) => ({
+        outer: piece.outer,
+        holes: [...piece.holes, ...holesForFootprint(piece.outer, courtyardHoles)],
+      }));
     }
 
     function buildWindowInstances(windowMaterial) {
@@ -1719,37 +2376,137 @@
       return shape;
     }
 
-    function addBuilding(element, centerLat, centerLon, wallMaterial, roofMaterial, capMaterial) {
-      const geometryPoints = element.geometry;
-      if (!geometryPoints || geometryPoints.length < 4) return;
+    function collectBuildingPartFootprints(elements, centerLat, centerLon) {
+      const footprints = [];
+      for (const building of iterBuildings(elements)) {
+        if (!building.isPart) continue;
+        const ringXZ = ringToXZ(building.geometry, centerLat, centerLon);
+        if (!ringIntersectsSector(ringXZ)) continue;
+        const clipped = clipPolygonToGround(ringXZ);
+        if (clipped && clipped.length >= 3) footprints.push(clipped);
+      }
+      return footprints;
+    }
 
-      const ringXZ = ringToXZ(geometryPoints, centerLat, centerLon);
-      if (!ringIntersectsSector(ringXZ)) return;
+    function partHolesForBuilding(clippedRing, partFootprints) {
+      if (!partFootprints || partFootprints.length === 0) return [];
+      return partFootprints.filter((part) => polygonsOverlap(clippedRing, part));
+    }
 
-      const clippedRing = clipPolygonToGround(ringXZ);
-      if (!clippedRing) return;
+    function ringToClipRing(ring) {
+      const closed = ring.length > 1
+        && Math.abs(ring[0].x - ring[ring.length - 1].x) < 1e-6
+        && Math.abs(ring[0].z - ring[ring.length - 1].z) < 1e-6;
+      const open = closed ? ring.slice(0, -1) : ring;
+      return open.map((point) => [point.x, point.z]);
+    }
 
-      const footprint = resolveBuildingFootprint(clippedRing, element.fillSolid);
-      const shape = buildShapeFromXZ(footprint);
-      const levels = buildingLevels(element.tags || {});
-      const height = levels * FLOOR_HEIGHT;
-      const renderOrderOffset = element.isPart ? 0.15 : 0;
+    function clipRingToXZ(ring) {
+      const points = ring.map(([x, z]) => ({ x, z }));
+      if (points.length >= 3) {
+        const first = points[0];
+        const last = points[points.length - 1];
+        if (Math.abs(first.x - last.x) > 1e-6 || Math.abs(first.z - last.z) > 1e-6) {
+          points.push({ x: first.x, z: first.z });
+        }
+      }
+      return points;
+    }
 
-      const bodyGeometry = new THREE.ExtrudeGeometry(shape, { depth: height, bevelEnabled: false });
-      bodyGeometry.rotateX(-Math.PI / 2);
-      bodyGeometry.translate(0, Y_BUILDING, 0);
-      const body = new THREE.Mesh(bodyGeometry, [capMaterial, wallMaterial]);
-      body.renderOrder = 1 + renderOrderOffset;
-      worldGroup.add(body);
+    function clipRingArea(ring) {
+      let sum = 0;
+      for (let i = 0; i < ring.length; i += 1) {
+        const j = (i + 1) % ring.length;
+        sum += ring[i][0] * ring[j][1] - ring[j][0] * ring[i][1];
+      }
+      return sum;
+    }
 
-      const roofGeometry = new THREE.ShapeGeometry(shape);
+    function asOuterClipRing(ring) {
+      const open = ringToClipRing(ring);
+      if (open.length < 3) return open;
+      return clipRingArea(open) > 0 ? open : open.slice().reverse();
+    }
+
+    function asHoleClipRing(ring) {
+      const open = ringToClipRing(ring);
+      if (open.length < 3) return open;
+      return clipRingArea(open) < 0 ? open : open.slice().reverse();
+    }
+
+    function subtractFootprintPieces(outerRing, subtractors) {
+      if (!subtractors || subtractors.length === 0) {
+        return [{ outer: outerRing, holes: [] }];
+      }
+
+      let multipolygon = [[asOuterClipRing(outerRing)]];
+      for (const subtractor of subtractors) {
+        if (!polygonsOverlap(outerRing, subtractor)) continue;
+        const clipHole = [[asHoleClipRing(subtractor)]];
+        const next = [];
+        for (const polygon of multipolygon) {
+          const diff = polygonClipping.difference([polygon], clipHole);
+          if (diff?.length) next.push(...diff);
+        }
+        multipolygon = next;
+        if (multipolygon.length === 0) break;
+      }
+
+      const pieces = [];
+      for (const polygon of multipolygon) {
+        if (!polygon?.length) continue;
+        const outer = clipRingToXZ(polygon[0]);
+        if (outer.length < 4) continue;
+        const holes = polygon.slice(1).map((ring) => clipRingToXZ(ring)).filter((ring) => ring.length >= 4);
+        pieces.push({ outer, holes });
+      }
+      return pieces;
+    }
+
+    function holesForFootprint(outerRing, holeRings) {
+      return holeRings.filter((hole) => polygonsOverlap(outerRing, hole));
+    }
+
+    function buildBuildingBodyShapes(footprintPieces, fillSolid) {
+      return footprintPieces.map((piece) => buildBuildingShape(piece.outer, piece.holes, fillSolid));
+    }
+
+    function renderBuildingVolume(volume, centerLat, centerLon, wallMaterial, roofMaterial, capMaterial) {
+      const { baseOffset, height, windowLevels } = volume.verticalOverride
+        ?? resolveBuildingVertical(volume.tags, volume.isPart);
+      if (height < FLOOR_HEIGHT * 0.25) return;
+
+      const baseY = Y_BUILDING + baseOffset;
+      const renderOrderOffset = volume.isPart ? 0.15 + baseOffset * 0.001 : baseOffset * 0.001;
+
+      const bodyShapes = buildBuildingBodyShapes(volume.footprintPieces, volume.fillSolid);
+      const roofShape = buildBuildingShape(
+        volume.roofRing,
+        volume.roofHoles || [],
+        volume.fillSolid
+      );
+      if (bodyShapes.length === 0 || !roofShape) return;
+
+      for (const shape of bodyShapes) {
+        const geometry = new THREE.ExtrudeGeometry(shape, { depth: height, bevelEnabled: false });
+        geometry.rotateX(-Math.PI / 2);
+        geometry.translate(0, baseY, 0);
+        const body = new THREE.Mesh(geometry, [capMaterial, wallMaterial]);
+        body.renderOrder = 1 + renderOrderOffset;
+        body.frustumCulled = false;
+        worldGroup.add(body);
+      }
+
+      const roofGeometry = new THREE.ShapeGeometry(roofShape);
       roofGeometry.rotateX(-Math.PI / 2);
-      roofGeometry.translate(0, Y_BUILDING + height + Y_ROOF_OFFSET, 0);
+      roofGeometry.translate(0, baseY + height + Y_ROOF_OFFSET, 0);
       const roof = new THREE.Mesh(roofGeometry, roofMaterial);
       roof.renderOrder = 2 + renderOrderOffset;
       worldGroup.add(roof);
 
-      collectWindowSlotsFromXZ(footprint, levels);
+      for (const piece of volume.footprintPieces) {
+        collectWindowSlotsFromXZ(piece.outer, windowLevels, baseY);
+      }
     }
 
     function buildDashedDividerRibbons(points, lateralOffset, baseY, elevationProfile = null) {
@@ -1801,9 +2558,50 @@
       return ribbons;
     }
 
-    function buildVariableDashedDividers(points, halfWidths, baseY, elevationProfile = null) {
+    function isHigherPriorityRoad(road, other) {
+      if (other.zorder < road.zorder) return true;
+      if (other.zorder === road.zorder && other.half > road.half + 0.25) return true;
+      return false;
+    }
+
+    function junctionDividerTrimAtPoint(roadIndex, pointIndex, roads, nodes) {
+      const road = roads[roadIndex];
+      if (road.lanes < 2) return 0;
+
+      const junction = road.points[pointIndex];
+      const connections = nodes.get(nodeKey(junction.x, junction.z)) || [];
+      let trim = 0;
+
+      for (const conn of connections) {
+        if (conn.roadIndex === roadIndex) continue;
+        const other = roads[conn.roadIndex];
+        if (other.undergroundTunnel) continue;
+        if (!isHigherPriorityRoad(road, other)) continue;
+        trim = Math.max(trim, other.half + LANE_WIDTH * 0.5);
+      }
+      return trim;
+    }
+
+    function shouldRenderDividerSegment(roadIndex, segmentIndex, roads, nodes) {
+      const road = roads[roadIndex];
+      if (road.lanes < 2) return false;
+
+      const cumDist = polylineCumulativeDistances(road.points);
+      const segMid = (cumDist[segmentIndex] + cumDist[segmentIndex + 1]) * 0.5;
+
+      for (let pointIndex = 0; pointIndex < road.points.length; pointIndex += 1) {
+        const trim = junctionDividerTrimAtPoint(roadIndex, pointIndex, roads, nodes);
+        if (trim <= 0) continue;
+        if (Math.abs(segMid - cumDist[pointIndex]) < trim) return false;
+      }
+      return true;
+    }
+
+    function buildVariableDashedDividers(points, halfWidths, baseY, elevationProfile, visibleMask, roadIndex, roads, nodes) {
       const ribbons = [];
       for (let i = 0; i < points.length - 1; i += 1) {
+        if (visibleMask && (!visibleMask[i] || !visibleMask[i + 1])) continue;
+        if (roads && nodes && !shouldRenderDividerSegment(roadIndex, i, roads, nodes)) continue;
         const segment = [points[i], points[i + 1]];
         const avgHalf = (halfWidths[i] + halfWidths[i + 1]) * 0.5;
         const lanes = Math.max(1, Math.round((avgHalf * 2) / LANE_WIDTH));
@@ -1833,43 +2631,102 @@
       return mesh;
     }
 
-    function addRoads(elements, centerLat, centerLon, borderMaterial, surfaceMaterial, dividerMaterial, buildingFootprints = []) {
-      const roads = prepareRoadWays(elements, centerLat, centerLon);
-      roads.sort((a, b) => highwayStyle(b.element.tags).zorder - highwayStyle(a.element.tags).zorder);
+    function addMergedEdgeLines(edgeGeometries, material, renderOrder) {
+      if (edgeGeometries.length === 0) return null;
+      const merged = mergeGeometries(edgeGeometries, false);
+      edgeGeometries.forEach((geometry) => geometry.dispose());
+      if (!merged) return null;
+      const lines = new THREE.LineSegments(merged, material);
+      lines.renderOrder = renderOrder;
+      lines.frustumCulled = false;
+      worldGroup.add(lines);
+      return lines;
+    }
 
-      const nodes = buildRoadNodeGraph(roads);
-      resolveBridges(roads, nodes);
-      const profiles = computeRoadProfiles(roads, nodes);
+    function nearestPointOnPolyline(x, z, points) {
+      let bestDist = Infinity;
+      let bestIndex = 0;
+      let bestT = 0;
+      for (let i = 0; i < points.length - 1; i += 1) {
+        const a = points[i];
+        const b = points[i + 1];
+        const dx = b.x - a.x;
+        const dz = b.z - a.z;
+        const lenSq = dx * dx + dz * dz;
+        let t = 0;
+        if (lenSq > 1e-8) {
+          t = ((x - a.x) * dx + (z - a.z) * dz) / lenSq;
+          t = THREE.MathUtils.clamp(t, 0, 1);
+        }
+        const px = a.x + dx * t;
+        const pz = a.z + dz * t;
+        const dist = Math.hypot(x - px, z - pz);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestIndex = i;
+          bestT = t;
+        }
+      }
+      return { index: bestIndex, t: bestT, dist: bestDist };
+    }
+
+    function isPointOverHiddenTunnelCorridor(x, z, roads) {
+      for (const tunnel of roads) {
+        if (!tunnel.undergroundTunnel) continue;
+        const nearest = nearestPointOnPolyline(x, z, tunnel.points);
+        if (nearest.dist > tunnel.half + 2.5) continue;
+        return true;
+      }
+      return false;
+    }
+
+    function roadMostlyOverHiddenTunnel(road, roads) {
+      if (road.undergroundTunnel) return false;
+      let covered = 0;
+      for (const point of road.points) {
+        if (isPointOverHiddenTunnelCorridor(point.x, point.z, roads)) covered += 1;
+      }
+      return covered >= Math.max(2, Math.ceil(road.points.length * 0.6));
+    }
+
+    function addRoads(elements, centerLat, centerLon, borderMaterial, surfaceMaterial, dividerMaterial, buildingFootprints = [], resolvedRoads = null) {
+      const { roads, profiles } = resolvedRoads || prepareResolvedRoads(elements, centerLat, centerLon);
 
       const borderRibbons = [];
       const surfaceRibbons = [];
       const dividerRibbons = [];
 
+      const nodes = buildRoadNodeGraph(roads);
+
       for (let i = 0; i < roads.length; i += 1) {
         const road = roads[i];
+        if (roadMostlyOverHiddenTunnel(road, roads)) continue;
+        if (road.undergroundTunnel) continue;
         const { pavement, border } = profiles[i];
         const elevationProfile = road.elevatedBridge && road.bridgeProfile
           ? road.bridgeProfile.heights
           : null;
 
-        const borderRibbon = buildRoadRibbonVariable(
+        const borderRibbon = buildRoadRibbonWithMask(
           road.points,
           border,
           Y_ROAD_BORDER,
-          elevationProfile
+          elevationProfile,
+          null
         );
         if (borderRibbon) borderRibbons.push(borderRibbon);
 
-        const surfaceRibbon = buildRoadRibbonVariable(
+        const surfaceRibbon = buildRoadRibbonWithMask(
           road.points,
           pavement,
           Y_ROAD_SURFACE,
-          elevationProfile
+          elevationProfile,
+          null
         );
         if (surfaceRibbon) surfaceRibbons.push(surfaceRibbon);
 
         dividerRibbons.push(
-          ...buildVariableDashedDividers(road.points, pavement, Y_ROAD_LINE, elevationProfile)
+          ...buildVariableDashedDividers(road.points, pavement, Y_ROAD_LINE, elevationProfile, null, i, roads, nodes)
         );
       }
 
@@ -1877,15 +2734,34 @@
       roadMeshes.surface = addMergedRoadMesh(surfaceRibbons, surfaceMaterial, 5);
       roadMeshes.divider = addMergedRoadMesh(dividerRibbons, dividerMaterial, 6);
 
+      const tunnelWallMaterial = new THREE.MeshBasicMaterial({
+        color: TUNNEL_WALL_COLOR,
+        side: THREE.DoubleSide,
+        depthWrite: true,
+        depthTest: true,
+      });
+      const tunnelEdgeMaterial = new THREE.LineBasicMaterial({
+        color: TUNNEL_PORTAL_EDGE_COLOR,
+        depthWrite: true,
+        depthTest: true,
+      });
+      const portalGeoms = collectTunnelPortals(roads, profiles, buildRoadNodeGraph(roads))
+        .map((portal) => buildTunnelWedgeGeometry(portal))
+        .filter(Boolean);
+      const portalEdgeGeoms = portalGeoms.map((geometry) => new THREE.EdgesGeometry(geometry, 4));
+      addMergedRoadMesh(portalGeoms, tunnelWallMaterial, 4.2);
+      addMergedEdgeLines(portalEdgeGeoms, tunnelEdgeMaterial, 4.25);
+
       const pillarMaterial = new THREE.MeshBasicMaterial({ color: 0x959591 });
       addBridgePillars(roads, buildingFootprints, pillarMaterial);
 
       updateRoadDetailLod(true);
+      return { roads, profiles };
     }
 
     function prepareFootways(elements, centerLat, centerLon) {
       return elements
-        .filter((e) => e.type === "way" && e.tags?.highway === "footway" && e.geometry)
+        .filter((e) => e.type === "way" && e.geometry && isPedestrianHighway(e.tags))
         .map((element) => {
           const rawPoints = element.geometry.map((p) => latLonToXZ(p.lat, p.lon, centerLat, centerLon));
           const points = dedupeRoadPoints(clipPolylineToSector(rawPoints));
@@ -2020,43 +2896,28 @@
       return false;
     }
 
-    function buildHoleShapeFromXZ(points) {
-      const shape = new THREE.Shape();
-      for (let index = points.length - 1; index >= 0; index -= 1) {
-        const point = points[index];
-        if (index === points.length - 1) shape.moveTo(point.x, -point.z);
-        else shape.lineTo(point.x, -point.z);
-      }
-      shape.closePath();
-      return shape;
-    }
-
-    function buildGreenShape(outerRing, buildingFootprints) {
-      const shape = buildShapeFromXZ(outerRing);
-      for (const footprint of buildingFootprints) {
-        if (polygonsOverlap(outerRing, footprint)) {
-          shape.holes.push(buildHoleShapeFromXZ(footprint));
-        }
-      }
-      return shape;
-    }
-
-    function collectBuildingFootprints(elements, centerLat, centerLon) {
+    function collectGreenAreaFootprints(elements, centerLat, centerLon) {
       const footprints = [];
-      for (const building of iterBuildings(elements)) {
-        const clipped = clipBuildingFootprint(building, centerLat, centerLon);
-        if (clipped) footprints.push(clipped);
+      for (const area of iterGreenAreas(elements)) {
+        const clipped = clipPolygonToSector(ringToXZ(area.geometry, centerLat, centerLon));
+        if (clipped && clipped.length >= 3) footprints.push(clipped);
       }
       return footprints;
     }
 
-    function addResidentialFloors(elements, centerLat, centerLon, material) {
+    function addResidentialFloors(elements, centerLat, centerLon, material, greenFootprints = [], tunnelHoleRings = []) {
       const geometries = [];
 
       for (const areaRing of iterResidentialAreas(elements)) {
         const clipped = clipPolygonToSector(ringToXZ(areaRing, centerLat, centerLon));
         if (!clipped) continue;
-        const shape = buildShapeFromXZ(clipped);
+        const holes = [
+          ...greenFootprints.filter((footprint) => polygonsOverlap(clipped, footprint)),
+          ...tunnelHoleRings.filter((footprint) => polygonsOverlap(clipped, footprint)),
+        ];
+        const shape = holes.length > 0
+          ? buildShapeWithHoles(clipped, holes)
+          : buildShapeFromXZ(clipped);
         const floorGeometry = new THREE.ShapeGeometry(shape);
         floorGeometry.rotateX(-Math.PI / 2);
         floorGeometry.translate(0, Y_RESIDENTIAL, 0);
@@ -2104,7 +2965,16 @@
       return `b:${Math.round(x / SCRUB_BUSH_GRID)}:${Math.round(z / SCRUB_BUSH_GRID)}`;
     }
 
-    function addGreenAreaFloors(elements, centerLat, centerLon, materials, buildingFootprints = []) {
+    function collectBuildingFootprints(elements, centerLat, centerLon) {
+      const footprints = [];
+      for (const building of iterBuildings(elements)) {
+        const clipped = clipBuildingFootprint(building, centerLat, centerLon);
+        if (clipped) footprints.push(clipped);
+      }
+      return footprints;
+    }
+
+    function addGreenAreaFloors(elements, centerLat, centerLon, materials, tunnelHoleRings = []) {
       const buckets = { forest: [], park: [], allotment: [], scrub: [] };
       const layerY = {
         park: Y_GREEN_PARK,
@@ -2116,7 +2986,10 @@
       for (const area of iterGreenAreas(elements)) {
         const clipped = clipPolygonToSector(ringToXZ(area.geometry, centerLat, centerLon));
         if (!clipped) continue;
-        const shape = buildGreenShape(clipped, buildingFootprints);
+        const holes = tunnelHoleRings.filter((footprint) => polygonsOverlap(clipped, footprint));
+        const shape = holes.length > 0
+          ? buildShapeWithHoles(clipped, holes)
+          : buildShapeFromXZ(clipped);
         const geometry = new THREE.ShapeGeometry(shape);
         geometry.rotateX(-Math.PI / 2);
         geometry.translate(0, layerY[area.kind], 0);
@@ -2470,14 +3343,40 @@
       }
     }
 
-    function addGroundPlane(groundMaterial) {
-      const ground = new THREE.Mesh(
-        new THREE.PlaneGeometry(SECTOR_SIZE, SECTOR_SIZE),
-        groundMaterial
-      );
-      ground.rotation.x = -Math.PI / 2;
+    function prepareResolvedRoads(elements, centerLat, centerLon) {
+      const roads = prepareRoadWays(elements, centerLat, centerLon);
+      roads.sort((a, b) => highwayStyle(b.element.tags).zorder - highwayStyle(a.element.tags).zorder);
+      const nodes = buildRoadNodeGraph(roads);
+      resolveBridges(roads, nodes);
+      resolveTunnels(roads, nodes);
+      const profiles = computeRoadProfiles(roads, nodes);
+      return { roads, profiles };
+    }
+
+    function sectorOuterRing() {
+      const edge = SECTOR_HALF;
+      return [
+        { x: -edge, z: -edge },
+        { x: edge, z: -edge },
+        { x: edge, z: edge },
+        { x: -edge, z: edge },
+      ];
+    }
+
+    function addGroundPlane(groundMaterial, tunnelHoleRings = []) {
+      let geometry;
+      if (tunnelHoleRings.length > 0) {
+        const shape = buildShapeWithHoles(sectorOuterRing(), tunnelHoleRings);
+        geometry = new THREE.ShapeGeometry(shape);
+        geometry.rotateX(-Math.PI / 2);
+      } else {
+        geometry = new THREE.PlaneGeometry(SECTOR_SIZE, SECTOR_SIZE);
+        geometry.rotateX(-Math.PI / 2);
+      }
+      const ground = new THREE.Mesh(geometry, groundMaterial);
       ground.position.y = Y_GROUND;
       ground.renderOrder = 0;
+      ground.frustumCulled = false;
       worldGroup.add(ground);
     }
 
@@ -2573,6 +3472,8 @@
           polygonOffsetUnits: -4,
         });
 
+        const resolvedRoads = prepareResolvedRoads(data.elements || [], lat, lon);
+
         addGroundPlane(groundMaterial);
 
         const residentialMaterial = new THREE.MeshBasicMaterial({
@@ -2585,7 +3486,8 @@
           polygonOffsetUnits: 1,
         });
         const buildingFootprints = collectBuildingFootprints(data.elements || [], lat, lon);
-        addResidentialFloors(data.elements || [], lat, lon, residentialMaterial);
+        const greenFootprints = collectGreenAreaFootprints(data.elements || [], lat, lon);
+        addResidentialFloors(data.elements || [], lat, lon, residentialMaterial, greenFootprints);
 
         const greenMaterials = {
           forest: new THREE.MeshBasicMaterial({
@@ -2625,15 +3527,12 @@
             polygonOffsetUnits: 3,
           }),
         };
-        addGreenAreaFloors(data.elements || [], lat, lon, greenMaterials, buildingFootprints);
+        addGreenAreaFloors(data.elements || [], lat, lon, greenMaterials);
 
-        for (const building of iterBuildings(data.elements || [])) {
-          if (building.isPart) continue;
-          addBuilding(building, lat, lon, wallMaterial, roofMaterial, capMaterial);
-        }
-        for (const building of iterBuildings(data.elements || [])) {
-          if (!building.isPart) continue;
-          addBuilding(building, lat, lon, wallMaterial, roofMaterial, capMaterial);
+        const mapElements = data.elements || [];
+        const buildingVolumes = spatialJoinBuildingVolumes(mapElements, lat, lon);
+        for (const volume of buildingVolumes) {
+          renderBuildingVolume(volume, lat, lon, wallMaterial, roofMaterial, capMaterial);
         }
         const roadBorderMaterial = new THREE.MeshBasicMaterial({
           color: 0xffffff,
@@ -2671,7 +3570,8 @@
           roadBorderMaterial,
           roadSurfaceMaterial,
           roadDividerMaterial,
-          buildingFootprints
+          buildingFootprints,
+          resolvedRoads
         );
 
         const footwayMaterial = new THREE.MeshBasicMaterial({
